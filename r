@@ -62,7 +62,7 @@ msg() {
   ls -a                  显示所有历史记录
   tail <job|job_id>      显示 <job> 最新一次运行的日志尾部，或 <job_id> 对应运行的日志尾部
   tail ... -n lines      显示日志最后 N 行
-  kill <job|job_id>      杀掉 <job> 最新一次运行中的任务，或 <job_id> 对应任务
+  kill <job|job_id>      杀掉 <job> 最新一次活动中的任务（运行中或排队中），或 <job_id> 对应任务
   rm <job|job_id>        删除 <job> 的所有记录，或删除 <job_id> 对应的单条记录
   rm -a                  删除所有已完成任务记录 (finished/failed/killed)
   rm -aa                 删除所有任务记录
@@ -70,10 +70,12 @@ msg() {
 提交参数:
   -n job_name            指定任务名
   -l logfile             指定日志文件名或路径
+  -p                     立即并行运行，跳过默认等待队列
   -h                     显示帮助
 
 说明:
-  - 自动后台运行
+  - 默认后台串行排队运行
+  - 使用 -p 可跳过队列并行运行
   - 断开 SSH 后任务仍继续
   - 自动记录日志
   - 任务结束后发送 Bark 通知
@@ -82,6 +84,7 @@ msg() {
 
 示例:
   r -n matlab_us -l output_US_new.log "matlab -nodisplay -r 'run_all; exit'"
+  r -p "python train.py"
   r ls
   r ls -a
   r tail matlab_us
@@ -107,7 +110,7 @@ Subcommands:
   ls -a                  Show all historical records
   tail <job|job_id>      Show the log tail of the latest run for <job>, or the exact run for <job_id>
   tail ... -n lines      Show the last N lines of the log
-  kill <job|job_id>      Kill the latest running instance of <job>, or the exact run for <job_id>
+  kill <job|job_id>      Kill the latest active instance of <job> (running or queued), or the exact run for <job_id>
   rm <job|job_id>        Remove all records for <job>, or one exact record for <job_id>
   rm -a                  Remove all completed job records (finished/failed/killed)
   rm -aa                 Remove all job records
@@ -115,10 +118,12 @@ Subcommands:
 Submission options:
   -n job_name            Set the job name
   -l logfile             Set the log file name or path
+  -p                     Run immediately in parallel and skip the default queue
   -h                     Show help
 
 Notes:
-  - Runs jobs in the background automatically
+  - Runs jobs in the background with sequential queueing by default
+  - Use -p to bypass the queue and run in parallel
   - Jobs survive SSH disconnects
   - Logs are recorded automatically
   - Sends a Bark notification when the job finishes
@@ -127,6 +132,7 @@ Notes:
 
 Examples:
   r -n matlab_us -l output_US_new.log "matlab -nodisplay -r 'run_all; exit'"
+  r -p "python train.py"
   r ls
   r ls -a
   r tail matlab_us
@@ -173,6 +179,15 @@ EOF
             ;;
         job_id_label)
             if lang_is_zh; then echo "任务ID"; else echo "Job ID"; fi
+            ;;
+        mode_label)
+            if lang_is_zh; then echo "模式"; else echo "Mode"; fi
+            ;;
+        mode_queued)
+            if lang_is_zh; then echo "串行队列"; else echo "queued"; fi
+            ;;
+        mode_parallel)
+            if lang_is_zh; then echo "并行"; else echo "parallel"; fi
             ;;
         no_job_record_for_id)
             if lang_is_zh; then echo "未找到 job_id 对应记录: $2"; else echo "No job record found for job_id: $2"; fi
@@ -305,6 +320,18 @@ job_field() {
     printf "%s\n" "$line" | awk -F '\t' -v i="$idx" '{print $i}'
 }
 
+reverse_file() {
+    local file="$1"
+
+    if command -v tac >/dev/null 2>&1; then
+        tac "$file"
+    elif command -v tail >/dev/null 2>&1 && tail -r /dev/null >/dev/null 2>&1; then
+        tail -r "$file"
+    else
+        awk '{lines[NR] = $0} END {for (i = NR; i >= 1; i--) print lines[i]}' "$file"
+    fi
+}
+
 job_runtime_status() {
     local line="$1"
     local db_status pid wrapper
@@ -314,6 +341,21 @@ job_runtime_status() {
 
     if [ "$db_status" = "finished" ] || [ "$db_status" = "failed" ] || [ "$db_status" = "killed" ]; then
         echo "$db_status"
+        return
+    fi
+
+    if [ "$db_status" = "queued" ]; then
+        if pid_alive "$pid"; then
+            echo "queued"
+            return
+        fi
+
+        if [ -n "$wrapper" ] && [ -f "$wrapper" ]; then
+            echo "queued"
+            return
+        fi
+
+        echo "unknown"
         return
     fi
 
@@ -407,7 +449,17 @@ refresh_db_runtime_statuses() {
     while IFS=$'\t' read -r job_id job submitted pid wrapper logfile workdir cmd status start_epoch end_epoch; do
         [ -n "${job_id:-}" ] || continue
 
-        if [ "$status" = "running" ] || [ "$status" = "unknown" ]; then
+        if [ "$status" = "queued" ]; then
+            if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+                status="queued"
+            else
+                if [ -f "${wrapper:-}" ]; then
+                    status="queued"
+                else
+                    status="unknown"
+                fi
+            fi
+        elif [ "$status" = "running" ] || [ "$status" = "unknown" ]; then
             if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
                 status="running"
             else
@@ -434,7 +486,7 @@ print_ls_latest_only() {
 
     msg table_header_latest
 
-    tac "$JOB_DB" | awk -F '\t' '!seen[$2]++ {print}' | while IFS=$'\t' read -r job_id job submitted pid wrapper logfile workdir cmd db_status start_epoch end_epoch; do
+    reverse_file "$JOB_DB" | awk -F '\t' '!seen[$2]++ {print}' | while IFS=$'\t' read -r job_id job submitted pid wrapper logfile workdir cmd db_status start_epoch end_epoch; do
         local line runtime duration_s duration_h
         line="$(db_get_line_by_job_id "$job_id")"
         runtime="$(job_runtime_status "$line")"
@@ -458,7 +510,7 @@ print_ls_all_history() {
 
     msg table_header_latest
 
-    tac "$JOB_DB" | while IFS=$'\t' read -r job_id job submitted pid wrapper logfile workdir cmd db_status start_epoch end_epoch; do
+    reverse_file "$JOB_DB" | while IFS=$'\t' read -r job_id job submitted pid wrapper logfile workdir cmd db_status start_epoch end_epoch; do
         [ -n "${job_id:-}" ] || continue
         local line runtime duration_s duration_h
         line="$(printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$job_id" "$job" "$submitted" "$pid" "$wrapper" "$logfile" "$workdir" "$cmd" "$db_status" "$start_epoch" "$end_epoch")"
@@ -512,7 +564,7 @@ kill_job() {
     status="$(job_runtime_status "$line")"
     now_epoch="$(date +%s)"
 
-    if [ "$status" != "running" ]; then
+    if [ "$status" != "running" ] && [ "$status" != "queued" ]; then
         msg job_not_running "$status"
         echo "$(msg job_label): $job_name"
         echo "$(msg job_id_label): $job_id"
@@ -610,14 +662,14 @@ submit_job() {
     local job_name="$1"
     local logfile="$2"
     local cmd="$3"
+    local run_parallel="${4:-0}"
 
     ensure_bark_config
 
-    local timestamp hostname_short workdir safe_job job_id start_epoch
+    local timestamp hostname_short workdir safe_job job_id
     timestamp="$(date +"%Y%m%d_%H%M%S")"
     hostname_short="$(hostname)"
     workdir="$(pwd)"
-    start_epoch="$(date +%s)"
 
     if [ -z "$job_name" ]; then
         job_name="job_${timestamp}"
@@ -635,19 +687,40 @@ submit_job() {
         esac
     fi
 
-    local wrapper pidfile wrapper_pid submitted_at api
+    mkdir -p "$(dirname "$logfile")"
+
+    local wrapper pidfile wrapper_pid submitted_at api initial_status mode_value
     wrapper="${META_DIR}/r_${safe_job}_${timestamp}_$$.sh"
     pidfile="${META_DIR}/${job_id}.pid"
     submitted_at="$(now_human)"
     api="$(bark_api)"
+
+    if [ "$run_parallel" = "1" ]; then
+        initial_status="running"
+        mode_value="$(msg mode_parallel)"
+    else
+        initial_status="queued"
+        mode_value="$(msg mode_queued)"
+    fi
+
+    {
+        echo "========== r job submit =========="
+        echo "job_id: $job_id"
+        echo "job_name: $job_name"
+        echo "host: $hostname_short"
+        echo "workdir: $workdir"
+        echo "submitted: $submitted_at"
+        echo "mode: $mode_value"
+        echo "command: $cmd"
+        echo "================================"
+        echo
+    } >> "$logfile"
 
     cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -u
 
 R_LANG=$(printf '%q' "$R_LANG")
-START_TIME=\$(date +%s)
-START_HUMAN=\$(date +"%Y-%m-%d %H:%M:%S")
 
 JOB_ID=$(printf '%q' "$job_id")
 HOSTNAME_SHORT=$(printf '%q' "$hostname_short")
@@ -662,8 +735,97 @@ TAIL_LINES=$(printf '%q' "$TAIL_LINES")
 TAIL_CHARS=$(printf '%q' "$TAIL_CHARS")
 JOB_DB=$(printf '%q' "$JOB_DB")
 WRAPPER_PATH=$(printf '%q' "$wrapper")
+RUN_IN_PARALLEL=$(printf '%q' "$run_parallel")
 
 lang_is_zh() { [ "\${R_LANG:-en}" = "zh" ]; }
+job_field() { printf "%s\n" "\$1" | awk -F '\t' -v i="\$2" '{print \$i}'; }
+pid_alive() { [ -n "\${1:-}" ] && kill -0 "\$1" 2>/dev/null; }
+
+job_blocks_queue() {
+    local db_status="\$1"
+    local pid="\$2"
+    local wrapper="\$3"
+
+    case "\$db_status" in
+        finished|failed|killed)
+            return 1
+            ;;
+    esac
+
+    if pid_alive "\$pid"; then
+        return 0
+    fi
+
+    if [ -n "\$wrapper" ] && [ -f "\$wrapper" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+mark_job_running() {
+    local start_epoch="\$1"
+    local tmp="\${JOB_DB}.tmp.start.\$\$"
+    awk -F '\t' -v OFS='\t' -v id="\$JOB_ID" -v start_epoch="\$start_epoch" '
+        \$1 == id {\$9 = "running"; \$10 = start_epoch}
+        {print}
+    ' "\$JOB_DB" > "\$tmp" && mv "\$tmp" "\$JOB_DB"
+}
+
+mark_job_finished() {
+    local final_status="\$1"
+    local start_epoch="\$2"
+    local end_epoch="\$3"
+    local tmp="\${JOB_DB}.tmp.finish.\$\$"
+    awk -F '\t' -v OFS='\t' -v id="\$JOB_ID" -v status="\$final_status" -v start_epoch="\$start_epoch" -v end_epoch="\$end_epoch" '
+        \$1 == id {
+            \$9 = status
+            if (\$10 == "") {\$10 = start_epoch}
+            \$11 = end_epoch
+        }
+        {print}
+    ' "\$JOB_DB" > "\$tmp" && mv "\$tmp" "\$JOB_DB"
+}
+
+wait_for_turn() {
+    local announced=0
+    local blocker found_self
+    local other_job_id other_job other_submitted other_pid other_wrapper other_logfile other_workdir other_cmd other_status other_start other_end
+
+    while :; do
+        blocker=0
+        found_self=0
+
+        while IFS=\$'\t' read -r other_job_id other_job other_submitted other_pid other_wrapper other_logfile other_workdir other_cmd other_status other_start other_end; do
+            [ -n "\${other_job_id:-}" ] || continue
+
+            if [ "\$other_job_id" = "\$JOB_ID" ]; then
+                found_self=1
+                break
+            fi
+
+            if job_blocks_queue "\$other_status" "\$other_pid" "\$other_wrapper"; then
+                blocker=1
+            fi
+        done < "\$JOB_DB"
+
+        if [ "\$found_self" -eq 1 ] && [ "\$blocker" -eq 0 ]; then
+            if [ "\$announced" -eq 1 ]; then
+                echo "\$QUEUE_START_LINE" >> "\$LOGFILE"
+                echo >> "\$LOGFILE"
+            fi
+            return 0
+        fi
+
+        if [ "\$announced" -eq 0 ]; then
+            echo "\$QUEUE_WAIT_LINE" >> "\$LOGFILE"
+            echo >> "\$LOGFILE"
+            announced=1
+        fi
+
+        sleep 2
+    done
+}
 
 if lang_is_zh; then
     TITLE_SUCCESS_PREFIX="任务成功: "
@@ -682,6 +844,8 @@ if lang_is_zh; then
     EXIT_CODE_LABEL="状态码"
     TRUNC_PREFIX="...（仅显示最后 "
     TRUNC_SUFFIX=" 个字符）"
+    QUEUE_WAIT_LINE="queue: 等待前序任务完成"
+    QUEUE_START_LINE="queue: 已获得执行槽位"
 else
     TITLE_SUCCESS_PREFIX="Job succeeded: "
     TITLE_FAILED_PREFIX="Job failed"
@@ -699,9 +863,19 @@ else
     EXIT_CODE_LABEL="Exit code"
     TRUNC_PREFIX="... (showing only the last "
     TRUNC_SUFFIX=" characters)"
+    QUEUE_WAIT_LINE="queue: waiting for earlier jobs to finish"
+    QUEUE_START_LINE="queue: acquired execution slot"
 fi
 
 cd "\$WORKDIR" || exit 127
+
+if [ "\$RUN_IN_PARALLEL" != "1" ]; then
+    wait_for_turn
+fi
+
+START_TIME=\$(date +%s)
+START_HUMAN=\$(date +"%Y-%m-%d %H:%M:%S")
+mark_job_running "\$START_TIME"
 
 {
     echo "========== r job meta =========="
@@ -789,11 +963,7 @@ fi
 
 curl -fsS "\${BARK_API}/\${TITLE_ENCODED}/\${BODY_ENCODED}?sound=\${DEFAULT_SOUND}&group=\${DEFAULT_GROUP}" >/dev/null 2>&1 || true
 
-TMP_DB="\${JOB_DB}.tmp.\$\$"
-awk -F '\t' -v OFS='\t' -v id="\$JOB_ID" -v status="\$FINAL_STATUS" -v end_epoch="\$END_TIME" '
-    \$1 == id {\$9 = status; \$11 = end_epoch}
-    {print}
-' "\$JOB_DB" > "\$TMP_DB" && mv "\$TMP_DB" "\$JOB_DB"
+mark_job_finished "\$FINAL_STATUS" "\$START_TIME" "\$END_TIME"
 
 rm -f "\$WRAPPER_PATH"
 EOF
@@ -810,11 +980,12 @@ EOF
     echo "$wrapper_pid" > "$pidfile"
     disown "$wrapper_pid" 2>/dev/null || true
 
-    db_add_job "$job_id" "$job_name" "$submitted_at" "$wrapper_pid" "$wrapper" "$logfile" "$workdir" "$cmd" "running" "$start_epoch" ""
+    db_add_job "$job_id" "$job_name" "$submitted_at" "$wrapper_pid" "$wrapper" "$logfile" "$workdir" "$cmd" "$initial_status" "" ""
 
     msg job_submitted
     echo "$(msg job_name_label): $job_name"
     echo "$(msg job_id_label): $job_id"
+    echo "$(msg mode_label): $mode_value"
     echo "$(msg pid_label): $wrapper_pid"
     echo "$(msg log_label): $logfile"
     echo "$(msg command_label): $cmd"
@@ -900,11 +1071,13 @@ fi
 
 JOB_NAME=""
 LOGFILE=""
+RUN_IN_PARALLEL=0
 
-while getopts ":n:l:h" opt; do
+while getopts ":n:l:ph" opt; do
     case "$opt" in
         n) JOB_NAME="$OPTARG" ;;
         l) LOGFILE="$OPTARG" ;;
+        p) RUN_IN_PARALLEL=1 ;;
         h)
             msg usage
             exit 0
@@ -928,4 +1101,4 @@ if [ $# -eq 0 ]; then
 fi
 
 CMD="$*"
-submit_job "$JOB_NAME" "$LOGFILE" "$CMD"
+submit_job "$JOB_NAME" "$LOGFILE" "$CMD" "$RUN_IN_PARALLEL"

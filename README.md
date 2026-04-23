@@ -12,6 +12,8 @@
 ## Features
 
 - Run long shell commands in the background
+- Queue jobs sequentially by default
+- Run immediately in parallel with `-p`
 - Survive SSH disconnects
 - Send Bark notifications when jobs finish
 - Include log tail in notifications
@@ -59,6 +61,10 @@ r "python train.py"
 
 ```bash
 r -n experiment "python train.py"
+```
+
+```bash
+r -p "python train.py"
 ```
 
 ```bash
@@ -121,6 +127,7 @@ Running long jobs over SSH is painful:
 
 ## Notes
 
+* `r` queues jobs by default; use `r -p ...` to bypass the queue
 * `r ls` shows unfinished jobs only
 * `r ls -a` shows full history
 * Logs are **not deleted** by `r rm`
